@@ -4,6 +4,7 @@
   #include <windows.h>
   #include <fileapi.h>
 #else
+  #include <pthread.h>
   #include <netdb.h>
   #include <sys/socket.h>
   #include <sys/ioctl.h>
@@ -14,6 +15,7 @@
   #define MAX_PATH PATH_MAX
 #endif
 
+#include <assert.h>
 #include <git2.h>
 #include <string.h>
 #include <stdio.h>
@@ -53,6 +55,92 @@
 #endif
 
 #define HTTPS_RESPONSE_HEADER_BUFFER_LENGTH 8192
+
+
+typedef struct {
+  #if _WIN32
+    HANDLE thread;
+    void* (*func)(void*);
+    void* data;
+  #else
+    pthread_t thread;
+  #endif
+} thread_t;
+
+typedef struct {
+  #if _WIN32
+    HANDLE mutex;
+  #else
+    pthread_mutex_t mutex;
+  #endif
+} mutex_t;
+
+static mutex_t* new_mutex() {
+  mutex_t* mutex = malloc(sizeof(mutex_t));
+  #if _WIN32
+    mutex->mutex = CreateMutex(NULL, FALSE, NULL);
+  #else
+    pthread_mutex_init(&mutex->mutex, NULL);
+  #endif
+  return mutex;
+}
+
+static void free_mutex(mutex_t* mutex) {
+  #if _WIN32
+    CloseHandle(mutex->mutex);
+  #else
+    pthread_mutex_destroy(&mutex->mutex);
+  #endif
+  free(mutex);
+}
+
+static void lock_mutex(mutex_t* mutex) {
+  #if _WIN32
+    WaitForSingleObject(mutex->mutex, INFINITE);
+  #else
+    pthread_mutex_lock(&mutex->mutex);
+  #endif
+}
+
+static void unlock_mutex(mutex_t* mutex) {
+  #if _WIN32
+    ReleaseMutex(mutex->mutex);
+  #else
+    pthread_mutex_unlock(&mutex->mutex);
+  #endif
+}
+
+
+#if _WIN32
+static DWORD windows_thread_callback(void* data) {
+  thread_t* thread = data;
+  thread->data = thread->func(thread->data);
+  return 0;
+}
+#endif
+
+static thread_t* create_thread(void* (*func)(void*), void* data) {
+  thread_t* thread = malloc(sizeof(thread_t));
+  #if _WIN32
+    thread->func = func;
+    thread->data = data;
+    thread->thread = CreateThread(NULL, 0, windows_thread_callback, thread, 0, NULL);
+  #else
+    pthread_create(&thread->thread, NULL, func, data);
+  #endif
+  return thread;
+}
+
+static void* join_thread(thread_t* thread) {
+  void* retval;
+  #if _WIN32
+    WaitForSingleObject(thread->thread, INFINITE);
+  #else
+    pthread_join(thread->thread, &retval);
+  #endif
+  free(thread);
+  return retval;
+}
 
 
 #if _WIN32
@@ -459,9 +547,22 @@ static int lpm_git_transport_certificate_check_cb(struct git_cert *cert, int val
   return 0; // If no_verify_ssl is enabled, basically always return 0 when this is set as callback.
 }
 
-static int lpm_git_transfer_progress_cb(const git_transfer_progress *stats, void *payload) {
-  lua_State* L = payload;
-  lua_pushvalue(L, 2);
+
+typedef struct {
+  git_repository* repository;
+  lua_State* L;
+  char refspec[512];
+  int depth;
+  int threaded;
+  int callback_function;
+  git_transfer_progress progress;
+  int complete;
+  int error;
+  char data[512];
+  thread_t* thread;
+} fetch_context_t;
+
+static int lpm_fetch_callback(lua_State* L, const git_transfer_progress *stats) {
   lua_pushinteger(L, stats->received_bytes);
   lua_pushinteger(L, stats->total_objects);
   lua_pushinteger(L, stats->indexed_objects);
@@ -469,56 +570,123 @@ static int lpm_git_transfer_progress_cb(const git_transfer_progress *stats, void
   lua_pushinteger(L, stats->local_objects);
   lua_pushinteger(L, stats->total_deltas);
   lua_pushinteger(L, stats->indexed_deltas);
-  lua_call(L, 7, 1);
-  int value = lua_tointeger(L, -1);
-  lua_pop(L, 1);
-  return value;
+  return lua_pcall(L, 7, 0, 0);
 }
 
-static int lpm_fetch(lua_State* L) {
-   git_init();
-  git_repository* repository = luaL_checkgitrepo(L, 1);
+static int lpm_git_transfer_progress_cb(const git_transfer_progress *stats, void *payload) {
+  fetch_context_t* context = (fetch_context_t*)payload;
+  if (!context->threaded) {
+    if (context->callback_function) {
+      lua_rawgeti(context->L, LUA_REGISTRYINDEX, context->callback_function);
+      lpm_fetch_callback(context->L, stats);
+    }
+  } else
+    context->progress = *stats;
+}
+
+static int lua_is_main_thread(lua_State* L) {
+  int is_main = lua_pushthread(L);
+  lua_pop(L, 1);
+  return is_main;
+}
+
+static void* lpm_fetch_thread(void* ctx) {
+  fflush(stderr);
   git_remote* remote;
-  if (git_remote_lookup(&remote, repository, "origin")) {
-    git_repository_free(repository);
-    return luaL_error(L, "git remote fetch error: %s", git_error_last_string());
+  fetch_context_t* context = (fetch_context_t*)ctx;
+  fflush(stderr);
+  int error = git_remote_lookup(&remote, context->repository, "origin");
+  if (error && !context->error) {
+    snprintf(context->data, sizeof(context->data), "git remote fetch error: %s", git_error_last_string());
+    error = context->error;
+    return NULL;
   }
-  const char* refspec = luaL_optstring(L, 3, NULL);
   git_fetch_options fetch_opts = GIT_FETCH_OPTIONS_INIT;
   fetch_opts.download_tags = GIT_REMOTE_DOWNLOAD_TAGS_ALL;
-  fetch_opts.callbacks.payload = L;
+  fetch_opts.callbacks.payload = context;
   #if (LIBGIT2_VER_MAJOR == 1 && LIBGIT2_VER_MINOR >= 7) || LIBGIT2_VER_MAJOR > 1
-  fetch_opts.depth = lua_toboolean(L, 4) ? GIT_FETCH_DEPTH_FULL : 1;
+  fetch_opts.depth = context->depth;
   #endif
   if (no_verify_ssl)
     fetch_opts.callbacks.certificate_check = lpm_git_transport_certificate_check_cb;
-  if (lua_type(L, 2) == LUA_TFUNCTION)
-    fetch_opts.callbacks.transfer_progress = lpm_git_transfer_progress_cb;
-  git_strarray array = { (char**)&refspec, 1 };
-  int error = git_remote_connect(remote, GIT_DIRECTION_FETCH, &fetch_opts.callbacks, NULL, NULL) ||
-    git_remote_download(remote, refspec ? &array : NULL, &fetch_opts) ||
+  fetch_opts.callbacks.transfer_progress = lpm_git_transfer_progress_cb;
+  char* strings[] = { context->refspec };
+  git_strarray array = { strings, 1 };
+
+  error = git_remote_connect(remote, GIT_DIRECTION_FETCH, &fetch_opts.callbacks, NULL, NULL) ||
+    git_remote_download(remote, context->refspec[0] ? &array : NULL, &fetch_opts) ||
     git_remote_update_tips(remote, &fetch_opts.callbacks, fetch_opts.update_fetchhead, fetch_opts.download_tags, NULL);
-  if (!error) {
+  if (!error && !context->error) {
     git_buf branch_name = {0};
     if (!git_remote_default_branch(&branch_name, remote)) {
-      lua_pushlstring(L, branch_name.ptr, branch_name.size);
+      strncpy(context->data, branch_name.ptr, sizeof(context->data));
       git_buf_dispose(&branch_name);
-    } else {
-      lua_pushnil(L);
     }
   }
   git_remote_disconnect(remote);
   git_remote_free(remote);
-  git_repository_free(repository);
-  if (error)
-    return luaL_error(L, "git remote fetch error: %s", git_error_last_string());
+  if (error && !context->error) {
+    snprintf(context->data, sizeof(context->data), "git remote fetch error: %s", git_error_last_string());
+    context->error = error;
+  }
+  context->complete = 1;
+  return NULL;
+}
+
+
+static int lpm_fetchk(lua_State* L, int status, lua_KContext ctx) {
+  lua_rawgeti(L, LUA_REGISTRYINDEX, (int)ctx);
+  fetch_context_t* context = lua_touserdata(L, -1);
+  lua_pop(L, 1);
+  if (context->threaded && context->callback_function) {
+    lua_rawgeti(L, LUA_REGISTRYINDEX, context->callback_function);
+    context->error = lpm_fetch_callback(L, &context->progress);
+    if (context->error)
+      strncpy(context->data, lua_tostring(L, -1), sizeof(context->data));
+  }
+  if (context->complete || context->error) {
+    join_thread(context->thread);
+    git_repository_free(context->repository);
+    if (context->data[0] == 0)
+      lua_pushnil(L);
+    else
+      lua_pushstring(L, context->data);
+    if (context->callback_function)
+      luaL_unref(L, LUA_REGISTRYINDEX, context->callback_function);
+    luaL_unref(L, LUA_REGISTRYINDEX, (int)ctx);
+    if (context->error)
+      lua_error(L);
+    return 1;
+  }
+  assert(context->threaded);
+  return lua_yieldk(L, 0, (lua_KContext)ctx, lpm_fetchk);
+}
+
+
+static int lpm_fetch(lua_State* L) {
+  git_init();
+  fetch_context_t* context = lua_newuserdata(L, sizeof(fetch_context_t));
+  memset(context, 0, sizeof(fetch_context_t));
+  context->repository = luaL_checkgitrepo(L, 1);
+  const char* refspec = luaL_optstring(L, 3, NULL);
+  context->depth = lua_toboolean(L, 4) ? GIT_FETCH_DEPTH_FULL : 1;
+  context->L = L;
+  context->threaded = !lua_is_main_thread(L);
+  if (refspec)
+    strncpy(context->refspec, refspec, sizeof(context->refspec));
   if (lua_type(L, 2) == LUA_TFUNCTION) {
     lua_pushvalue(L, 2);
-    lua_pushboolean(L, 1);
-    lua_pushvalue(L, -3);
-    lua_call(L, 2, 0);
+    context->callback_function = luaL_ref(L, LUA_REGISTRYINDEX);
   }
-  return 1;
+  int ctx = luaL_ref(L, LUA_REGISTRYINDEX);
+  if (lua_is_main_thread(L)) {
+    lpm_fetch_thread(context);
+    lpm_fetchk(L, 0, ctx);
+    return 0;
+  } else {
+    context->thread = create_thread(lpm_fetch_thread, context);
+    return lua_yieldk(L, 0, (lua_KContext)ctx, lpm_fetchk);
+  }
 }
 
 static int mbedtls_snprintf(int mbedtls, char* buffer, int len, int status, const char* str, ...) {

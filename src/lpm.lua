@@ -395,6 +395,7 @@ function common.read(path) local f, err = io.open(path, "rb") if not f then erro
 function common.uniq(l) local t = {} local k = {} for i,v in ipairs(l) do if not k[v] then table.insert(t, v) k[v] = true end end return t end
 function common.delete(h, d) local t = {} for k,v in pairs(h) do if k ~= d then t[k] = v end end return t end
 function common.canonical_order(hash) local t = {} for k,v in pairs(hash) do table.insert(t, k) end table.sort(t) return t end
+function common.keys(h) local t = {} for k,v in pairs(h) do table.insert(t, k) end return t end
 function common.split(splitter, str)
   local o = 1
   local res = {}
@@ -534,12 +535,11 @@ end
 global({
   LATEST_MOD_VERSION = "3.0.0",
   EXECUTABLE_EXTENSION = PLATFORM == "windows" and ".exe" or "",
-  SHOULD_COLOR = ((PLATFORM == "windows" or (os.getenv("TERM") and os.getenv("TERM") ~= "dumb")) and not os.getenv("NO_COLOR")) or false
+  SHOULD_COLOR = ((PLATFORM == "windows" or (os.getenv("TERM") and os.getenv("TERM") ~= "dumb")) and not os.getenv("NO_COLOR")) or false,
+  SINGLE_THREAD = false
 })
-global({ "HOME", "USERDIR", "CACHEDIR", "JSON", "TABLE", "HEADER", "RAW", "VERBOSE", "FILTRATION", "MOD_VERSION", "QUIET", "FORCE", "REINSTALL", "CONFIG",  "NO_COLOR", "AUTO_PULL_REMOTES", "ARCH", "ASSUME_YES", "NO_INSTALL_OPTIONAL", "TMPDIR", "DATADIR", "BINARY", "POST", "PROGRESS", "SYMLINK", "REPOSITORY", "EPHEMERAL", "MASK", "settings", "repositories", "lite_xls", "system_bottle", "progress_bar_label", "write_progress_bar" })
-global({ Addon = {}, Repository = {}, LiteXL = {}, Bottle = {}, lpm = {}, log = {} })
-
--- in the cases where we don't have a manifest, assume generalized structure, take addons folder, trawl through it, build manifest that way
+global({ "HOME", "USERDIR", "CACHEDIR", "JSON", "TABLE", "HEADER", "RAW", "VERBOSE", "FILTRATION", "MOD_VERSION", "QUIET", "FORCE", "REINSTALL", "CONFIG",  "NO_COLOR", "AUTO_PULL_REMOTES", "ARCH", "ASSUME_YES", "NO_INSTALL_OPTIONAL", "TMPDIR", "DATADIR", "BINARY", "POST", "PROGRESS", "SYMLINK", "REPOSITORY", "EPHEMERAL", "MASK", "settings", "repositories", "lite_xls", "system_bottle", "write_progress_bar" })
+global({ Addon = {}, Repository = {}, LiteXL = {}, Bottle = {}, lpm = { threads = {} }, log = {}, progress = setmetatable({}, { __mode = 'k' }) })-- in the cases where we don't have a manifest, assume generalized structure, take addons folder, trawl through it, build manifest that way
 -- assuming each .lua file under the `addons` folder is a addon. also parse the README, if present, and see if any of the addons
 -- Ignore any requries that are in CORE_PLUGINS.
 local CORE_PLUGINS = {
@@ -585,13 +585,18 @@ end
 function log.fatal_warning(message)
   if not FORCE then error(message .. "; use --force to override") else log.warning(message) end
 end
-function log.progress_action(message)
+function log.progress_action(message, multimessage, func)
   if write_progress_bar then
-    progress_bar_label = message
+    local routine = coroutine.running()
+    progress[routine] = { message = message, multimessage = multimessage, objects_read = 0, objects_total = 0, bytes_read = 0 }
+    local status, err = pcall(func)
+    progress[routine] = nil
+    if not status then error(err, 0) end
   else
     log.action(message)
   end
 end
+
 local function prompt(message)
   system.tcflush(0)
   if not ASSUME_YES or not JSON then
@@ -1248,34 +1253,37 @@ function Repository:fetch()
   if self:is_local() then return self end
   local path, temporary_path
   local status, err = pcall(function()
+    local hash = system.hash((self.remote or "") .. (self.branch or "") .. (self.commit or ""))
     if not self.branch and not self.commit then
-      temporary_path = TMPDIR .. PATHSEP .. "transient-repo"
+      temporary_path = TMPDIR .. PATHSEP .. "transient-" .. hash
       common.rmrf(temporary_path)
       common.mkdirp(temporary_path)
-      log.progress_action("Fetching " .. self.remote .. "...")
       system.init(temporary_path, self.remote)
-      self.branch = system.fetch(temporary_path, write_progress_bar):gsub("^refs/heads/", "")
-      if not self.branch then error("Can't find remote branch for " .. self.remote) end
-      path = self.repo_path .. PATHSEP .. self.branch
-      self.local_path = path
-      common.reset(temporary_path, self.branch, "hard")
+      log.progress_action("Fetching " .. self.remote .. "...", "Fetching mulitple repositories...", function()
+        self.branch = system.fetch(temporary_path, write_progress_bar):gsub("^refs/heads/", "")
+        if not self.branch then error("Can't find remote branch for " .. self.remote) end
+        path = self.repo_path .. PATHSEP .. self.branch
+        self.local_path = path
+        common.reset(temporary_path, self.branch, "hard")
+      end)
     else
       path = self.local_path
       local exists = system.stat(path)
       if not exists then
-        temporary_path = TMPDIR .. PATHSEP .. "tranient-repo"
+        temporary_path = TMPDIR .. PATHSEP .. "transient-" .. hash
         common.rmrf(temporary_path)
         common.mkdirp(temporary_path)
         system.init(temporary_path, self.remote)
       end
       if not exists or self.branch then
-        log.progress_action("Fetching " .. self.remote .. ":" .. (self.commit or self.branch) .. "...")
-        local status, err = pcall(system.fetch, temporary_path or path, write_progress_bar, self.commit or ("+refs/heads/" .. self.branch  .. ":refs/remotes/origin/" .. self.branch))
-        if not status and err:find("cannot fetch a specific object") then
-          system.fetch(temporary_path or path, write_progress_bar, nil, true)
-        elseif not status then
-          error(err, 0)
-        end
+        log.progress_action("Fetching " .. self.remote .. ":" .. (self.commit or self.branch) .. "...", "Fetching mulitple repositories...", function()
+          local status, err = pcall(system.fetch, temporary_path or path, write_progress_bar, self.commit or ("+refs/heads/" .. self.branch  .. ":refs/remotes/origin/" .. self.branch))
+          if not status and err:find("cannot fetch a specific object") then
+            system.fetch(temporary_path or path, write_progress_bar, nil, true)
+          elseif not status then
+            error(err, 0)
+          end
+        end)
         common.reset(temporary_path or path, self.commit or self.branch, "hard")
       end
       self.manifest = nil
@@ -1302,8 +1310,10 @@ function Repository:add(pull_remotes)
   if pull_remotes then -- any remotes we don't have in our listing, call add, and add into the list
     for i, remote in ipairs(remotes) do
       if not common.first(repositories, function(repo) return repo.remote == remote.remote and repo.branch == remote.branch and repo.commit == remote.commit end) then
-        remote:add(pull_remotes == "recursive" and "recursive" or false)
-        table.insert(repositories, remote)
+        lpm.thread(function()
+          table.insert(repositories, remote)
+          remote:add(pull_remotes == "recursive" and "recursive" or false)
+        end)
       end
     end
   end
@@ -1314,13 +1324,14 @@ end
 function Repository:update(pull_remotes)
   local manifest, remotes = self:parse_manifest()
   if self.branch then
-    log.progress_action("Updating " .. self:url() .. "...")
-    local status, err = pcall(system.fetch, self.local_path, write_progress_bar, "+refs/heads/" .. self.branch  .. ":refs/remotes/origin/" .. self.branch)
-    if not status then -- see https://github.com/lite-xl/lite-xl-plugin-manager/issues/85
-      if not err:find("object not found %- no match for id") then error(err, 0) end
-      common.rmrf(self.local_path)
-      return self:fetch()
-    end
+    log.progress_action("Updating " .. self:url() .. "...", "Updating mulitple repositories...", function()
+      local status, err = pcall(system.fetch, self.local_path, write_progress_bar, "+refs/heads/" .. self.branch  .. ":refs/remotes/origin/" .. self.branch)
+      if not status then -- see https://github.com/lite-xl/lite-xl-plugin-manager/issues/85
+        if not err:find("object not found %- no match for id") then error(err, 0) end
+        common.rmrf(self.local_path)
+        self:fetch()
+      end
+    end)
     common.reset(self.local_path, self.branch, "hard")
     self.manifest = nil
     manifest, remotes = self:parse_manifest()
@@ -1723,8 +1734,9 @@ function lpm.repo_init(repos)
   common.mkdirp(CACHEDIR)
   if not system.stat(CACHEDIR .. PATHSEP .. "settings.json") then
     for i, repository in ipairs(repos or DEFAULT_REPOS) do
-      table.insert(repositories, repository:add(true))
+      lpm.thread(function() repositories[i] = repository:add(true) end)
     end
+    lpm.join()
     lpm.repo_save()
   end
 end
@@ -2258,6 +2270,26 @@ function lpm.setup()
   if REPOSITORY then repositories = common.map(type(REPOSITORY) == "table" and REPOSITORY or { REPOSITORY }, function(url) local repo = Repository.url(url) repo:parse_manifest() return repo end) end
 end
 
+function lpm.thread(func, ...)
+  if SINGLE_THREAD then return func() end
+  table.insert(lpm.threads, coroutine.create(func, ...))
+  if not select(2, coroutine.running()) then coroutine.yield() end
+end
+
+function lpm.join()
+  if SINGLE_THREAD then return end
+  while #lpm.threads > 0 do
+    for i,v in ipairs(lpm.threads) do
+      local status, err = coroutine.resume(v)
+      if not status then error(err, 0) end
+      if coroutine.status(v) == "dead" then
+        table.remove(lpm.threads, i)
+        break
+      end
+    end
+  end
+end
+
 function lpm.command(ARGS)
   if not ARGS[2]:find("%S") then return
   elseif ARGS[2] == "init" then return
@@ -2491,6 +2523,8 @@ Flags have the following effects:
                            for customizing lpm for various tasks. Can be
                            specified as a remote URL. By default, will always
                            load all the plugins specified in $HOME/.config/lpm/plugins.
+  --single-thread          Ensures that only a single thread is used to download things.
+                           Can probably resolve issues with timing.
 
 The following flags are useful when listing addons, or generating the addon
 table. Putting a ! infront of the string will invert the filter. Multiple
@@ -2585,6 +2619,7 @@ not commonly used publically.
   PROGRESS = ARGS["progress"]
   REINSTALL = ARGS["reinstall"]
   NO_COLOR = ARGS["no-color"]
+  SINGLE_THREAD = ARGS["single-thread"]
   DATADIR = common.normalize_path(ARGS["datadir"])
   BINARY = common.normalize_path(ARGS["binary"])
   NO_INSTALL_OPTIONAL = ARGS["no-install-optional"]
@@ -2618,40 +2653,55 @@ not commonly used publically.
     end
     if JSON then
       write_progress_bar = function(total_read, total_objects_or_content_length, indexed_objects, received_objects, local_objects, local_deltas, indexed_deltas)
+        local status = progress[coroutine.running()]
         if type(total_read) == "boolean" then
-          io.stdout:write(json.encode({ progress = { percent = 1, label = progress_bar_label } }) .. "\n")
+          io.stdout:write(json.encode({ progress = { percent = 1, label = status.message } }) .. "\n")
           io.stdout:flush()
           last_read = nil
           return
         end
         if not last_read then last_read = system.time() end
         if not last_read or system.time() - last_read > 0.05 then
-          io.stdout:write(json.encode({ progress = { percent = (received_objects and (received_objects/total_objects_or_content_length) or (total_read/total_objects_or_content_length) or 0), label = progress_bar_label } }) .. "\n")
+          io.stdout:write(json.encode({ progress = { percent = (received_objects and (received_objects/total_objects_or_content_length) or (total_read/total_objects_or_content_length) or 0), label = status.message } }) .. "\n")
           io.stdout:flush()
           last_read = system.time()
         end
       end
     else
-      write_progress_bar = function(total_read, total_objects_or_content_length, indexed_objects, received_objects, local_objects, local_deltas, indexed_deltas)
-        if type(total_read) == "boolean" then
+      write_progress_bar = function(operation_read, operation_objects_or_content_length, indexed_objects, received_objects)
+        local status = progress[coroutine.running()]
+        local progress_bar_label = #common.keys(progress) > 1 and status.multimessage or status.message
+        if type(operation_read) == "boolean" then
           if not last_read then io.stdout:write(progress_bar_label) end
           io.stdout:write("\n")
           io.stdout:flush()
           last_read = nil
           return
         end
-        if not start_time or not last_read or total_read < last_read then start_time = system.time() end
-        local status_line = total_objects_or_content_length and total_objects_or_content_length > 0 and
-          string.format("%s [%s/s][%03d%%]: ", format_bytes(total_read), format_bytes(total_read / (system.time() - start_time)), math.floor((received_objects and (received_objects/total_objects_or_content_length) or (total_read/total_objects_or_content_length) or 0)*100)) or
-          string.format("%s [%s/s]: ", format_bytes(total_read), format_bytes(total_read / (system.time() - start_time)))
+        status.bytes_read = operation_read
+        status.objects_read = received_objects or operation_read
+        status.objects_total = operation_objects_or_content_length
+
+        local total_bytes_read = 0
+        local total_objects_read = 0
+        local total_objects = 0
+        for k, v in pairs(progress) do
+          total_bytes_read = total_bytes_read + v.bytes_read
+          total_objects_read = total_objects_read + v.objects_read
+          total_objects = total_objects + v.objects_total
+        end
+
+        if not start_time or not last_read or total_bytes_read < last_read then start_time = system.time() end
+        local status_line = total_objects > 0 and
+          string.format("%s [%s/s][%03d%%]: ", format_bytes(total_bytes_read), format_bytes(total_bytes_read / (system.time() - start_time)), math.floor((total_objects_read/total_objects or 0)*100)) or
+          string.format("%s [%s/s]: ", format_bytes(total_bytes_read), format_bytes(total_bytes_read / (system.time() - start_time)))
         local terminal_width = system.tcwidth(1)
         if not terminal_width then terminal_width = #status_line + #progress_bar_label end
         local characters_remaining = terminal_width - #status_line
         local message = progress_bar_label:sub(1, characters_remaining)
-        io.stdout:write("\r")
-        io.stdout:write(status_line .. message)
+        io.stdout:write("\r" .. status_line .. message .. string.rep(" ", characters_remaining - #message))
         io.stdout:flush()
-        last_read = total_read
+        last_read = total_bytes_read
       end
     end
   end
