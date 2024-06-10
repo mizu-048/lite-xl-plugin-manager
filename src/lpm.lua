@@ -636,6 +636,7 @@ function common.get(source, options)
     if checksum ~= "SKIP" and system.stat(cache_path) and system.hash(cache_path, "file") ~= checksum then common.rmrf(cache_path) end
     local res
     if not system.stat(cache_path) then
+      common.mkdirp(common.dirname(cache_path))
       res, headers = system.get(protocol, hostname, port, rest, cache_path .. ".part", callback)
       if headers.location then return common.get(headers.location, common.merge(options, {  })) end
       if checksum ~= "SKIP" and system.hash(cache_path .. ".part", "file") ~= checksum then

@@ -1272,6 +1272,7 @@ static int lpm_set_error(get_context_t* context, const char* str, ...) {
   va_start(va, str);
     offset = vsnprintf(context->error, sizeof(context->error), str, va);
   va_end(va);
+  context->error_code = -1;
   return offset;
 }
 
@@ -1301,42 +1302,46 @@ static int lpm_getk(lua_State* L, int status, lua_KContext ctx) {
       context->buffer[0] = 0;
     }
     case STATE_RECV_HEADER: {
-      const char* header_end = strstr(context->buffer, "\r\n\r\n");
-      if (!header_end && context->buffer_length >= sizeof(context->buffer) - 1 && lpm_set_error(context, "response header buffer length exceeded"))
-        goto cleanup;
-      if (!header_end) {
-        int length = lpm_socket_read(context, -1);
-        if (length < 0 && lpm_get_error(context, length, "can't read from socket"))
+      const char* header_end;
+      while (1) {
+        header_end = strstr(context->buffer, "\r\n\r\n");
+        if (!header_end && context->buffer_length >= sizeof(context->buffer) - 1 && lpm_set_error(context, "response header buffer length exceeded"))
           goto cleanup;
-        if (length == 0)
-          return lua_yieldk(L, 0, ctx, lpm_getk);
-      } else {
-        header_end += 4;
-        const char* protocol_end = strnstr_local(context->buffer, " ", context->buffer_length);
-        int code = atoi(protocol_end + 1);
-        if (code != 200) {
-          if (code >= 301 && code <= 303) {
-            const char* location = get_header(context->buffer, "location", &context->buffer_length);
-            if (location) {
-              lua_pushnil(L);
-              lua_newtable(L);
-              lua_pushlstring(L, location, context->buffer_length);
-              lua_setfield(L, -2, "location");
+        if (!header_end) {
+          int length = lpm_socket_read(context, -1);
+          if (length < 0 && lpm_get_error(context, length, "can't read from socket"))
+            goto cleanup;
+          if (length == 0)
+            return lua_yieldk(L, 0, ctx, lpm_getk);
+        } else {
+          header_end += 4;
+          const char* protocol_end = strnstr_local(context->buffer, " ", context->buffer_length);
+          int code = atoi(protocol_end + 1);
+          if (code != 200) {
+            if (code >= 301 && code <= 303) {
+              const char* location = get_header(context->buffer, "location", &context->buffer_length);
+              if (location) {
+                lua_pushnil(L);
+                lua_newtable(L);
+                lua_pushlstring(L, location, context->buffer_length);
+                lua_setfield(L, -2, "location");
+              } else
+                lpm_set_error(context, "received invalid %d-response", code);
             } else
-              lpm_set_error(context, "received invalid %d-response", code);
-          } else
-            lpm_set_error(context, "received non 200-response of %d", code);
-          goto cleanup;
+              lpm_set_error(context, "received non 200-response of %d", code);
+            goto report;
+          }
+          const char* transfer_encoding = get_header(context->buffer, "transfer-encoding", NULL);
+          context->chunked = transfer_encoding && strncmp(transfer_encoding, "chunked", 7) == 0 ? 1 : 0;
+          const char* content_length_value = get_header(context->buffer, "content-length", NULL);
+          context->content_length = content_length_value ? atoi(content_length_value) : -1;
+          context->buffer_length -= (header_end - context->buffer);
+          if (context->buffer_length > 0)
+            memmove(context->buffer, header_end, context->buffer_length);
+          context->chunk_length = !context->chunked && context->content_length == -1 ? INT_MAX : context->content_length;
+          context->state = STATE_RECV_BODY;
+          break;
         }
-        const char* transfer_encoding = get_header(context->buffer, "transfer-encoding", NULL);
-        context->chunked = transfer_encoding && strncmp(transfer_encoding, "chunked", 7) == 0 ? 1 : 0;
-        const char* content_length_value = get_header(context->buffer, "content-length", NULL);
-        context->content_length = content_length_value ? atoi(content_length_value) : -1;
-        context->buffer_length -= (header_end - context->buffer);
-        if (context->buffer_length > 0)
-          memmove(context->buffer, header_end, context->buffer_length);
-        context->chunk_length = !context->chunked && context->content_length == -1 ? INT_MAX : context->content_length;
-        context->state = STATE_RECV_BODY;
       }
     }
     case STATE_RECV_BODY: {
@@ -1414,26 +1419,30 @@ static int lpm_getk(lua_State* L, int status, lua_KContext ctx) {
     }
   }
   finish:
-  if (context->file)
+  if (context->file) {
     lua_pushnil(L);
-  else {
+    lua_newtable(L);
+  } else {
     lua_rawgeti(L, LUA_REGISTRYINDEX, context->lua_buffer);
-    int len = lua_rawlen(L, -1);
+    size_t len = lua_rawlen(L, -1);
     luaL_Buffer b;
+    int table = lua_gettop(L);
     luaL_buffinit(L, &b);
     for (int i = 1; i <= len; ++i) {
-      lua_rawgeti(L, -2, i);
+      lua_rawgeti(L, table, i);
       size_t str_len;
       const char* str = lua_tolstring(L, -1, &str_len);
-      luaL_addlstring(&b, str, str_len);
       lua_pop(L, 1);
+      luaL_addlstring(&b, str, str_len);
     }
     lua_pop(L, 1);
     luaL_pushresult(&b);
+    lua_newtable(L);
   }
   if (context->content_length != -1 && context->total_downloaded != context->content_length && lpm_set_error(context, "error retrieving full response"))
     goto cleanup;
-  if (context->callback_function) {
+  report:
+  if (context->callback_function && !context->error_code) {
     lua_rawgeti(L, LUA_REGISTRYINDEX, context->callback_function);
     lua_pushboolean(L, 1);
     lua_call(L, 1, 0);
@@ -1445,8 +1454,12 @@ static int lpm_getk(lua_State* L, int status, lua_KContext ctx) {
   } else {
     close(context->s);
   }
+  if (context->callback_function)
+    luaL_unref(L, LUA_REGISTRYINDEX, context->callback_function);
   if (context->file)
     fclose(context->file);
+  else
+    luaL_unref(L, LUA_REGISTRYINDEX, context->lua_buffer);
   if (context->error_code)
     return luaL_error(L, "%s", context->error);
   return 2;
@@ -1462,7 +1475,7 @@ static int lpm_get(lua_State* L) {
   strncpy(context->rest, luaL_checkstring(L, 4), sizeof(context->rest));
   const char* path = luaL_optstring(L, 5, NULL);
   if (path) {
-    if ((context->file = lua_fopen(L, path, "wb")) != NULL)
+    if ((context->file = lua_fopen(L, path, "wb")) == NULL)
       return luaL_error(L, "can't open file %s: %s", path, strerror(errno));
   } else {
     lua_newtable(L);
@@ -1493,6 +1506,7 @@ static int lpm_get(lua_State* L) {
       mbedtls_net_free(&context->net);
       return luaL_error(L, "%s", context->error);
     }
+    context->is_ssl = 1;
     context->state = STATE_HANDSHAKE;
   } else {
     int port = luaL_checkinteger(L, 3);
