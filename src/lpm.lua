@@ -592,6 +592,7 @@ function log.progress_action(message, multimessage, func)
     local status, err = pcall(func)
     progress[routine] = nil
     if not status then error(err, 0) end
+    return err
   else
     log.action(message)
   end
@@ -618,33 +619,38 @@ function common.get(source, options)
   if not source then error("requires url") end
   if #depth > 10 then error("too many redirects") end
   local _, _, protocol, hostname, port, rest = source:find("^(https?)://([^:/?]+):?(%d*)(.*)$")
-  if #depth == 1 then log.progress_action("Downloading " .. options.depth[1]:sub(1, 100) .. "...") end
-  if not protocol then error("malfomed url " .. source) end
-  if not port or port == "" then port = protocol == "https" and 443 or 80 end
-  if not rest or rest == "" then rest = "/" end
-  local res, headers
-  if checksum == "SKIP" and not target then
-    res, headers = system.get(protocol, hostname, port, rest, target, callback)
-    if headers.location then return common.get(headers.location, common.merge(options, { })) end
+
+  local download = function()
+    if not protocol then error("malfomed url " .. source) end
+    if not port or port == "" then port = protocol == "https" and 443 or 80 end
+    if not rest or rest == "" then rest = "/" end
+    local res, headers
+    if checksum == "SKIP" and not target then
+      res, headers = system.get(protocol, hostname, port, rest, target, callback)
+      if headers.location then return common.get(headers.location, common.merge(options, { })) end
+      return res
+    end
+    local cache_dir = checksum == "SKIP" and TMPDIR or (options.cache or CACHEDIR)
+    if not system.stat(cache_dir .. PATHSEP .. "files") then common.mkdirp(cache_dir .. PATHSEP .. "files") end
+    local cache_path = cache_dir .. PATHSEP .. "files" .. PATHSEP .. system.hash(checksum .. options.depth[1])
+    if checksum ~= "SKIP" and system.stat(cache_path) and system.hash(cache_path, "file") ~= checksum then common.rmrf(cache_path) end
+    local res
+    if not system.stat(cache_path) then
+      res, headers = system.get(protocol, hostname, port, rest, cache_path .. ".part", callback)
+      if headers.location then return common.get(headers.location, common.merge(options, {  })) end
+      if checksum ~= "SKIP" and system.hash(cache_path .. ".part", "file") ~= checksum then
+        common.rmrf(cache_path .. ".part")
+        log.fatal_warning("checksum doesn't match for " .. options.depth[1])
+      end
+      common.rename(cache_path .. ".part", cache_path)
+    end
+    if target then common.copy(cache_path, target) else res = io.open(cache_path, "rb"):read("*all") end
+    if checksum == "SKIP" then common.rmrf(cache_path) end
     return res
   end
-  local cache_dir = checksum == "SKIP" and TMPDIR or (options.cache or CACHEDIR)
-  if not system.stat(cache_dir .. PATHSEP .. "files") then common.mkdirp(cache_dir .. PATHSEP .. "files") end
-  local cache_path = cache_dir .. PATHSEP .. "files" .. PATHSEP .. system.hash(checksum .. options.depth[1])
-  if checksum ~= "SKIP" and system.stat(cache_path) and system.hash(cache_path, "file") ~= checksum then common.rmrf(cache_path) end
-  local res
-  if not system.stat(cache_path) then
-    res, headers = system.get(protocol, hostname, port, rest, cache_path .. ".part", callback)
-    if headers.location then return common.get(headers.location, common.merge(options, {  })) end
-    if checksum ~= "SKIP" and system.hash(cache_path .. ".part", "file") ~= checksum then
-      common.rmrf(cache_path .. ".part")
-      log.fatal_warning("checksum doesn't match for " .. options.depth[1])
-    end
-    common.rename(cache_path .. ".part", cache_path)
-  end
-  if target then common.copy(cache_path, target) else res = io.open(cache_path, "rb"):read("*all") end
-  if checksum == "SKIP" then common.rmrf(cache_path) end
-  return res
+
+  if #depth == 1 then return log.progress_action("Downloading " .. options.depth[1]:sub(1, 100) .. "...", nil, download) end
+  return download()
 end
 
 
@@ -1482,10 +1488,13 @@ function Bottle:construct()
   end
   local installing = {}
   for i,addon in ipairs(self.addons) do
-    if not installing[addon.id] then
-      addon:install(self, installing)
-    end
+    lpm.thread(function()
+      if not installing[addon.id] then
+        addon:install(self, installing)
+      end
+    end)
   end
+  lpm.join()
   -- atomically move things
   common.rmrf(local_path)
   common.mkdirp(common.dirname(local_path))
@@ -2006,10 +2015,13 @@ function lpm.install(type, ...)
   if #to_install == 0 and #potential_addon_list == 0 then error("no addons specified for install") end
   local installing = {}
   common.each(to_install, function(e)
-    if not installing[e.id] and (REINSTALL or not e:is_installed(system_bottle)) then
-      e:install(system_bottle, installing)
-    end
+    lpm.thread(function()
+      if not installing[e.id] and (REINSTALL or not e:is_installed(system_bottle)) then
+        e:install(system_bottle, installing)
+      end
+    end)
   end)
+  lpm.join()
   settings.installed = common.concat(settings.installed, to_explicitly_install)
   lpm.settings_save()
 end
@@ -2371,7 +2383,7 @@ xpcall(function()
     ["ssl-certs"] = "string", force = "flag", arch = "array", ["assume-yes"] = "flag",
     ["no-install-optional"] = "flag", datadir = "string", binary = "string", trace = "flag", progress = "flag",
     symlink = "flag", reinstall = "flag", ["no-color"] = "flag", config = "string", table = "string", header = "string",
-    repository = "string", ephemeral = "flag", mask = "array", raw = "string", plugin = "array",
+    repository = "string", ephemeral = "flag", mask = "array", raw = "string", plugin = "array", ["single-thread"] = "flag",
     -- filtration flags
     author = "array", tag = "array", stub = "array", dependency = "array", status = "array",
     type = "array", name = "array"
@@ -2802,9 +2814,10 @@ not commonly used publically.
     os.exit(0)
   end
   if ARGS[2] == "download" then
-    if ARGS[4] then log.progress_action("Downloading " .. ARGS[3]) end
-    local file = common.get(ARGS[3], { target = ARGS[4], callback = write_progress_bar });
-    if file then print(file) end
+    log.progress_action("Downloading " .. ARGS[3], nil, function()
+      local file = common.get(ARGS[3], { target = ARGS[4], callback = ARGS[4] and write_progress_bar });
+      if file then print(file) end
+    end)
     os.exit(0)
   end
   if ARGS[2] == "hash" then
