@@ -558,8 +558,9 @@ typedef struct {
   int threaded;
   int callback_function;
   git_transfer_progress progress;
+  int progress_update;
   int complete;
-  int error;
+  int error_code;
   char data[512];
   thread_t* thread;
 } fetch_context_t;
@@ -582,8 +583,11 @@ static int lpm_git_transfer_progress_cb(const git_transfer_progress *stats, void
       lua_rawgeti(context->L, LUA_REGISTRYINDEX, context->callback_function);
       lpm_fetch_callback(context->L, stats);
     }
-  } else
+  } else {
     context->progress = *stats;
+    context->progress_update = 1;
+  }
+  return 0;
 }
 
 static int lua_is_main_thread(lua_State* L) {
@@ -593,14 +597,12 @@ static int lua_is_main_thread(lua_State* L) {
 }
 
 static void* lpm_fetch_thread(void* ctx) {
-  fflush(stderr);
   git_remote* remote;
   fetch_context_t* context = (fetch_context_t*)ctx;
-  fflush(stderr);
   int error = git_remote_lookup(&remote, context->repository, "origin");
-  if (error && !context->error) {
+  if (error && !context->error_code) {
     snprintf(context->data, sizeof(context->data), "git remote fetch error: %s", git_error_last_string());
-    error = context->error;
+    context->error_code = error;
     return NULL;
   }
   git_fetch_options fetch_opts = GIT_FETCH_OPTIONS_INIT;
@@ -618,7 +620,7 @@ static void* lpm_fetch_thread(void* ctx) {
   error = git_remote_connect(remote, GIT_DIRECTION_FETCH, &fetch_opts.callbacks, NULL, NULL) ||
     git_remote_download(remote, context->refspec[0] ? &array : NULL, &fetch_opts) ||
     git_remote_update_tips(remote, &fetch_opts.callbacks, fetch_opts.update_fetchhead, fetch_opts.download_tags, NULL);
-  if (!error && !context->error) {
+  if (!error && !context->error_code) {
     git_buf branch_name = {0};
     if (!git_remote_default_branch(&branch_name, remote)) {
       strncpy(context->data, branch_name.ptr, sizeof(context->data));
@@ -627,9 +629,9 @@ static void* lpm_fetch_thread(void* ctx) {
   }
   git_remote_disconnect(remote);
   git_remote_free(remote);
-  if (error && !context->error) {
+  if (error && !context->error_code) {
     snprintf(context->data, sizeof(context->data), "git remote fetch error: %s", git_error_last_string());
-    context->error = error;
+    context->error_code = error;
   }
   context->complete = 1;
   return NULL;
@@ -640,24 +642,22 @@ static int lpm_fetchk(lua_State* L, int status, lua_KContext ctx) {
   lua_rawgeti(L, LUA_REGISTRYINDEX, (int)ctx);
   fetch_context_t* context = lua_touserdata(L, -1);
   lua_pop(L, 1);
-  if (context->threaded && context->callback_function) {
+  if (context->threaded && !context->error_code && context->callback_function && context->progress_update) {
     lua_rawgeti(L, LUA_REGISTRYINDEX, context->callback_function);
-    context->error = lpm_fetch_callback(L, &context->progress);
-    if (context->error)
+    context->error_code = lpm_fetch_callback(L, &context->progress);
+    if (context->error_code)
       strncpy(context->data, lua_tostring(L, -1), sizeof(context->data));
   }
-  if (context->complete || context->error) {
+  if (context->complete || context->error_code) {
     join_thread(context->thread);
     git_repository_free(context->repository);
-    if (context->data[0] == 0)
-      lua_pushnil(L);
-    else
-      lua_pushstring(L, context->data);
+    lua_pushstring(L, context->data[0] == 0 ? NULL : context->data);
     if (context->callback_function)
       luaL_unref(L, LUA_REGISTRYINDEX, context->callback_function);
     luaL_unref(L, LUA_REGISTRYINDEX, (int)ctx);
-    if (context->error)
-      lua_error(L);
+    if (context->error_code) {
+      return lua_error(L);
+    }
     return 1;
   }
   assert(context->threaded);
@@ -667,11 +667,12 @@ static int lpm_fetchk(lua_State* L, int status, lua_KContext ctx) {
 
 static int lpm_fetch(lua_State* L) {
   git_init();
+  int args = lua_gettop(L);
   fetch_context_t* context = lua_newuserdata(L, sizeof(fetch_context_t));
   memset(context, 0, sizeof(fetch_context_t));
   context->repository = luaL_checkgitrepo(L, 1);
-  const char* refspec = luaL_optstring(L, 3, NULL);
-  context->depth = lua_toboolean(L, 4) ? GIT_FETCH_DEPTH_FULL : 1;
+  const char* refspec = args >= 3 ? luaL_optstring(L, 3, NULL) : NULL;
+  context->depth = args >= 4 && lua_toboolean(L, 4) ? GIT_FETCH_DEPTH_FULL : 1;
   context->L = L;
   context->threaded = !lua_is_main_thread(L);
   if (refspec)
