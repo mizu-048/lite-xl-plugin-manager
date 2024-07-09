@@ -5,7 +5,7 @@
       "version": "0.1",
       "description": "A GUI interface to Adam's lite-xl plugin manager.",
       "path": "plugins/plugin_manager",
-      "mod_version": 3,
+      "mod_version": 4,
       "files": [
         {
           "url": "https://github.com/lite-xl/lite-xl-plugin-manager/releases/download/latest/lpm.x86_64-linux",
@@ -108,7 +108,7 @@
     }
   ],
   "remotes": [
-    "https://github.com/lite-xl/lite-xl-plugins.git:master",
+    "https://github.com/lite-xl/lite-xl-plugins.git:3.0",
     "https://github.com/lite-xl/lite-xl-colors.git:master"
   ]
 }
